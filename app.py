@@ -3,7 +3,6 @@ import os
 import tempfile
 import time
 import asyncio
-import replicate
 import requests
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
@@ -64,24 +63,29 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="title">🎬 AI Video Generator</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Generate a video from AI‑created images using prompts</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Create a video from prompts or your own images</div>', unsafe_allow_html=True)
 
 # Sidebar settings
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    replicate_api_key = st.text_input("Replicate API Key", type="password", 
-                                      placeholder="Enter your Replicate API key", 
-                                      help="Get your key from replicate.com")
-    if replicate_api_key:
-        os.environ["REPLICATE_API_TOKEN"] = replicate_api_key
+    # Image source selection
+    image_source = st.radio("Image Source", 
+                            ["Generate with Hugging Face", "Generate with Replicate", "Upload your own images"],
+                            help="Hugging Face is free with a token; Replicate requires credits; Upload uses your own images.")
     
-    st.markdown("---")
-    model_choice = st.selectbox("Image Model", 
-                                ["stability-ai/stable-diffusion-3.5-large", 
-                                 "black-forest-labs/FLUX.1-dev",
-                                 "stability-ai/stable-diffusion-2-1"])
-    st.caption("Note: Some models may have a cost per generation.")
+    if image_source == "Generate with Hugging Face":
+        hf_token = st.text_input("Hugging Face API Token", type="password", 
+                                 placeholder="Get token from huggingface.co/settings/tokens",
+                                 help="Free; get a token from huggingface.co")
+        hf_model = st.selectbox("Model", ["stabilityai/stable-diffusion-2-1", "runwayml/stable-diffusion-v1-5"])
+    elif image_source == "Generate with Replicate":
+        replicate_key = st.text_input("Replicate API Key", type="password", 
+                                      placeholder="Get key from replicate.com/account/api-tokens",
+                                      help="Requires credits. See replicate.com/pricing")
+        replicate_model = st.selectbox("Model", ["stability-ai/stable-diffusion-3.5-large", "black-forest-labs/FLUX.1-dev"])
+    else:
+        st.info("You will upload images in the main area.")
     
     st.markdown("---")
     st.subheader("Video Settings")
@@ -110,11 +114,20 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
 # Main area
-st.subheader("📝 Prompts for Images")
-st.caption("Enter one prompt per line. Each prompt will generate a slide in the video.")
+st.subheader("📝 Prompts for Images (if generating)")
+st.caption("Enter one prompt per line. Each prompt will generate a slide.")
 prompts_text = st.text_area("Prompts", height=200, 
                             placeholder="e.g.\nA modern money transfer app on a smartphone\nA family receiving money in Haiti\nA fast digital payment interface\nA happy customer using mobile money")
 prompts = [p.strip() for p in prompts_text.split('\n') if p.strip()]
+
+# If user uploads own images
+uploaded_images = []
+if image_source == "Upload your own images":
+    uploaded_files = st.file_uploader("Upload images (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    if uploaded_files:
+        for f in uploaded_files:
+            img = Image.open(f).convert('RGB')
+            uploaded_images.append(img)
 
 col1, col2, col3 = st.columns([1,1,1])
 with col1:
@@ -127,65 +140,51 @@ with col2:
 video_placeholder = st.empty()
 
 # Helper functions
-def generate_image(prompt, model, api_key):
-    """Generate an image using Replicate and return the URL."""
-    if not api_key:
+def generate_image_hf(prompt, token, model):
+    """Generate an image using Hugging Face inference API."""
+    if not token:
         return None
+    API_URL = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"inputs": prompt}
     try:
-        # Different models have different input schemas; we'll use common parameters
-        if "stable-diffusion-3.5" in model:
-            input = {
-                "prompt": prompt,
-                "aspect_ratio": "16:9",
-                "output_format": "png",
-                "output_quality": 90
-            }
-        elif "FLUX" in model:
-            input = {
-                "prompt": prompt,
-                "aspect_ratio": "16:9",
-                "output_format": "png"
-            }
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+        if response.status_code == 200:
+            return response.content  # returns raw image bytes
         else:
-            input = {
-                "prompt": prompt,
-                "num_inference_steps": 30,
-                "guidance_scale": 7.5,
-                "width": 1024,
-                "height": 576  # 16:9
-            }
+            st.error(f"Hugging Face error {response.status_code}: {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"HF API error: {e}")
+        return None
+
+def generate_image_replicate(prompt, token, model):
+    """Generate an image using Replicate."""
+    if not token:
+        return None
+    import replicate
+    os.environ["REPLICATE_API_TOKEN"] = token
+    try:
+        # Model-specific input
+        if "stable-diffusion" in model or "FLUX" in model:
+            input = {"prompt": prompt, "aspect_ratio": "16:9", "output_format": "png"}
+        else:
+            input = {"prompt": prompt, "num_inference_steps": 30, "guidance_scale": 7.5}
         output = replicate.run(model, input=input)
-        # output can be a list of URLs or a single URL
         if isinstance(output, list):
-            return output[0]
+            return output[0]  # URL
         elif isinstance(output, str):
             return output
         else:
-            st.error(f"Unexpected output format: {output}")
             return None
     except Exception as e:
-        st.error(f"Failed to generate image: {e}")
-        return None
-
-def download_image(url):
-    """Download an image from a URL and return a PIL Image."""
-    try:
-        response = requests.get(url, timeout=30)
-        if response.status_code == 200:
-            img = Image.open(io.BytesIO(response.content)).convert('RGB')
-            return img
-        else:
-            st.error(f"Failed to download image: {response.status_code}")
-            return None
-    except Exception as e:
-        st.error(f"Download error: {e}")
+        st.error(f"Replicate error: {e}")
         return None
 
 def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=(1920,1080)):
-    """Resize image to target size and optionally add text overlay."""
+    """Resize image and optionally add text overlay."""
     if img.size != size:
         img.thumbnail(size, Image.Resampling.LANCZOS)
-        # Create a new image with the target size and paste centered
         new_img = Image.new('RGB', size, (0,0,0))
         x = (size[0] - img.width) // 2
         y = (size[1] - img.height) // 2
@@ -197,7 +196,6 @@ def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=
             font = ImageFont.truetype("Arial", font_size)
         except:
             font = ImageFont.load_default()
-        # Wrap text to fit width
         max_width = size[0] - 100
         lines = []
         words = text.split()
@@ -215,7 +213,6 @@ def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=
                     line = word + " "
             if line:
                 lines.append(line.strip())
-        # Draw each line centered
         total_height = 0
         for line in lines:
             bbox = draw.textbbox((0,0), line, font=font)
@@ -226,7 +223,7 @@ def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=
             bbox = draw.textbbox((0,0), line, font=font)
             w = bbox[2] - bbox[0]
             x_text = (size[0] - w) // 2
-            # Draw with black stroke for readability
+            # Black stroke
             for dx in (-2,0,2):
                 for dy in (-2,0,2):
                     draw.text((x_text+dx, y_text+dy), line, font=font, fill='black')
@@ -235,16 +232,13 @@ def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=
     return img
 
 def create_video(image_list, durations, output_path, music_path=None, transition_duration=1, size=(1920,1080)):
-    """Create a video from a list of images with crossfade transitions."""
     clips = []
     for idx, img in enumerate(image_list):
-        # Convert PIL to numpy array for moviepy
         img_np = np.array(img)
         clip = mp.ImageClip(img_np).set_duration(durations[idx]).resize(size)
         if idx > 0 and transition_duration > 0:
             clip = clip.crossfadein(transition_duration)
         clips.append(clip)
-    
     video = mp.concatenate_videoclips(clips, method="compose")
     if music_path and os.path.exists(music_path):
         audio = mp.AudioFileClip(music_path)
@@ -252,121 +246,107 @@ def create_video(image_list, durations, output_path, music_path=None, transition
             audio = audio.loop(duration=video.duration)
         else:
             audio = audio.subclip(0, video.duration)
-        audio = audio.volumex(0.3)  # lower volume
+        audio = audio.volumex(0.3)
         video = video.set_audio(audio)
-    
-    video.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac', 
+    video.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac',
                           temp_audiofile='temp_audio.m4a', remove_temp=True, verbose=False, logger=None)
     return output_path
 
 # Generate logic
 if generate_btn:
-    if not prompts:
-        st.error("Please enter at least one prompt.")
-    else:
-        if not replicate_api_key:
-            st.warning("No Replicate API key provided. Using placeholder images for demonstration (no AI generation).")
-            # Use placeholder images (gradient colors) for demo
-            use_demo = True
+    images = []
+    if image_source == "Upload your own images":
+        if not uploaded_images:
+            st.error("Please upload at least one image.")
         else:
-            use_demo = False
-        
-        with st.spinner("Generating images and composing video... This may take a few minutes."):
-            images = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            if use_demo:
-                # Generate placeholder images (gradient) with prompt text
-                for i, prompt in enumerate(prompts):
-                    status_text.text(f"Creating placeholder {i+1}/{len(prompts)}: {prompt[:30]}...")
-                    img = Image.new('RGB', video_size, color=(20,40,80))
-                    draw = ImageDraw.Draw(img)
-                    try:
-                        font = ImageFont.truetype("Arial", 40)
-                    except:
-                        font = ImageFont.load_default()
-                    # Draw prompt on image
-                    lines = prompt.split('\n')
-                    y = 200
-                    for line in lines:
-                        draw.text((50, y), line, font=font, fill='white')
-                        y += 50
-                    images.append(img)
-                    progress_bar.progress((i+1)/len(prompts))
-            else:
-                # Real generation via Replicate
+            images = [img.copy() for img in uploaded_images]
+    else:
+        if not prompts:
+            st.error("Please enter at least one prompt.")
+        else:
+            # Generation via HF or Replicate
+            with st.spinner("Generating images..."):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
                 for i, prompt in enumerate(prompts):
                     status_text.text(f"Generating image {i+1}/{len(prompts)}: {prompt[:30]}...")
-                    img_url = generate_image(prompt, model_choice, replicate_api_key)
-                    if img_url:
-                        pil_img = download_image(img_url)
-                        if pil_img:
-                            # Optionally add title overlay (first slide gets product name)
-                            text_overlay = product_name if i == 0 and product_name else None
-                            slide_img = create_slide_image(pil_img, text=text_overlay, 
-                                                           text_color=title_color, 
-                                                           font_size=title_font_size, 
-                                                           size=video_size)
-                            images.append(slide_img)
-                        else:
-                            st.error(f"Failed to download image for prompt: {prompt}")
+                    img_data = None
+                    if image_source == "Generate with Hugging Face":
+                        if not hf_token:
+                            st.error("Hugging Face token is required.")
                             break
-                    else:
-                        st.error(f"Failed to generate image for prompt: {prompt}")
-                        break
+                        img_bytes = generate_image_hf(prompt, hf_token, hf_model)
+                        if img_bytes:
+                            img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                            img_data = img
+                    else:  # Replicate
+                        if not replicate_key:
+                            st.error("Replicate token is required.")
+                            break
+                        img_url = generate_image_replicate(prompt, replicate_key, replicate_model)
+                        if img_url:
+                            try:
+                                resp = requests.get(img_url, timeout=30)
+                                if resp.status_code == 200:
+                                    img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+                                    img_data = img
+                                else:
+                                    st.error(f"Download failed: {resp.status_code}")
+                            except Exception as e:
+                                st.error(f"Download error: {e}")
+                    if img_data:
+                        # Add title overlay on first slide
+                        text_overlay = product_name if i == 0 and product_name else None
+                        slide_img = create_slide_image(img_data, text=text_overlay,
+                                                       text_color=title_color,
+                                                       font_size=title_font_size,
+                                                       size=video_size)
+                        images.append(slide_img)
                     progress_bar.progress((i+1)/len(prompts))
-            
-            if images:
-                # Durations: first and last slightly longer? or all same
-                durations = [duration_per_image] * len(images)
-                # If a title overlay is present, maybe make first slide longer
-                # Not needed; we can adjust.
-                
-                # Create temporary files
-                temp_dir = tempfile.mkdtemp()
-                video_path = os.path.join(temp_dir, f"output_{uuid.uuid4().hex[:8]}.mp4")
-                
-                # Handle music file
-                music_path = None
-                if music_file:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-                        tmp.write(music_file.read())
-                        music_path = tmp.name
-                
-                create_video(images, durations, video_path, music_path, transition_duration, video_size)
-                
-                # Read video and display
-                with open(video_path, "rb") as f:
-                    video_bytes = f.read()
-                b64 = base64.b64encode(video_bytes).decode()
-                video_html = f"""
-                <video width="100%" controls autoplay>
-                    <source src="data:video/mp4;base64,{b64}" type="video/mp4">
-                </video>
-                """
-                video_placeholder.markdown(video_html, unsafe_allow_html=True)
-                
-                st.download_button(
-                    label="⬇️ Download Video (MP4)",
-                    data=video_bytes,
-                    file_name="generated_video.mp4",
-                    mime="video/mp4",
-                    use_container_width=True
-                )
-                
-                # Cleanup temp files
-                for f in os.listdir(temp_dir):
-                    try:
-                        os.remove(os.path.join(temp_dir, f))
-                    except:
-                        pass
-                os.rmdir(temp_dir)
-                if music_path and os.path.exists(music_path):
-                    os.remove(music_path)
-            else:
-                st.error("No images generated. Please check your prompts and API key.")
+                status_text.empty()
+                progress_bar.empty()
 
-# Footer
+    if images:
+        # Build video
+        with st.spinner("Composing video..."):
+            durations = [duration_per_image] * len(images)
+            temp_dir = tempfile.mkdtemp()
+            video_path = os.path.join(temp_dir, f"output_{uuid.uuid4().hex[:8]}.mp4")
+            music_path = None
+            if music_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+                    tmp.write(music_file.read())
+                    music_path = tmp.name
+            create_video(images, durations, video_path, music_path, transition_duration, video_size)
+            
+            # Display & download
+            with open(video_path, "rb") as f:
+                video_bytes = f.read()
+            b64 = base64.b64encode(video_bytes).decode()
+            video_html = f"""
+            <video width="100%" controls autoplay>
+                <source src="data:video/mp4;base64,{b64}" type="video/mp4">
+            </video>
+            """
+            video_placeholder.markdown(video_html, unsafe_allow_html=True)
+            st.download_button(
+                label="⬇️ Download Video (MP4)",
+                data=video_bytes,
+                file_name="generated_video.mp4",
+                mime="video/mp4",
+                use_container_width=True
+            )
+            # Cleanup
+            for f in os.listdir(temp_dir):
+                try:
+                    os.remove(os.path.join(temp_dir, f))
+                except:
+                    pass
+            os.rmdir(temp_dir)
+            if music_path and os.path.exists(music_path):
+                os.remove(music_path)
+    else:
+        st.error("No images generated. Please check your prompts, API keys, or uploaded images.")
+
 st.markdown("---")
 st.caption("Built with ❤️ by Gesner Deslandes | GlobalInternet.py")
