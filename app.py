@@ -1,21 +1,19 @@
 import streamlit as st
 import os
 import tempfile
-import subprocess
-import sys
 import asyncio
 import edge_tts
 import numpy as np
-import cv2
 import base64
 import uuid
 import shutil
 import math
 from PIL import Image, ImageDraw, ImageFont
 import mediapipe as mp
+import moviepy.editor as mp_editor
 
 # Page config
-st.set_page_config(page_title="Realistic AI Talking Head", page_icon="🎭", layout="wide")
+st.set_page_config(page_title="AI Talking Head", page_icon="🎭", layout="wide")
 
 st.markdown("""
 <style>
@@ -26,13 +24,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<h1 style="text-align:center;">🎭 AI Talking Head Generator</h1>', unsafe_allow_html=True)
-st.markdown('<p style="text-align:center;">Upload a portrait – choose between realistic Wav2Lip or fast face‑warping.</p>', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center;">Upload a portrait – the app animates the mouth naturally using AI (no OpenCV needed).</p>', unsafe_allow_html=True)
 
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
-    method = st.radio("Method", ["Face‑warping (fast, no download)", "Wav2Lip (realistic, heavy)"],
-                      help="Wav2Lip requires a one‑time model download (≈300MB).")
     voice_lang = st.selectbox("Voice Language", ["en-US", "en-GB", "fr-FR", "es-ES", "pt-BR"])
     voice_gender = st.radio("Voice Gender", ["Female", "Male"])
     voice_map = {
@@ -72,106 +68,68 @@ with col2:
 video_placeholder = st.empty()
 
 # ------------------------------------------------------------------
-# MediaPipe Face Mesh – get mouth landmarks
+# MediaPipe Face Mesh – get mouth landmarks (no cv2)
 # ------------------------------------------------------------------
 mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, min_detection_confidence=0.5)
 
-def get_mouth_landmarks(image_path):
-    """Detect face landmarks using MediaPipe and return mouth outer contour points."""
-    image = cv2.imread(image_path)
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb)
+def get_mouth_points(image_pil):
+    """Detect mouth contour using MediaPipe, return list of (x,y) points in pixel coords."""
+    # Convert PIL to RGB numpy array (MediaPipe expects RGB)
+    img_rgb = np.array(image_pil.convert('RGB'))
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, min_detection_confidence=0.5) as face_mesh:
+        results = face_mesh.process(img_rgb)
     if not results.multi_face_landmarks:
         return None
     landmarks = results.multi_face_landmarks[0]
-    h, w, _ = image.shape
-    # Mouth outer contour indices (0-11 for outer lip)
-    mouth_indices = [0, 13, 14, 17, 37, 39, 40, 61, 78, 80, 81, 82, 84, 87, 88, 91, 95, 146, 178, 181, 185, 191, 267, 269, 270, 291, 308, 310, 311, 312, 314, 317, 318, 321, 324, 325, 375, 402, 405, 415]
-    # Actually we just need the outer lip contour (like dlib's outer mouth)
-    # We'll use a simpler set: 61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308
-    # But for warping we need the convex hull of the mouth
-    # Let's get all mouth points (outer and inner)
-    mouth_points = []
-    for idx in [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]:
+    h, w, _ = img_rgb.shape
+    # We'll collect outer mouth points (indices from MediaPipe Face Mesh)
+    # Use a comprehensive set that forms a closed loop
+    mouth_indices = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
+    points = []
+    for idx in mouth_indices:
         x = int(landmarks.landmark[idx].x * w)
         y = int(landmarks.landmark[idx].y * h)
-        mouth_points.append((x, y))
-    # Add top lip and bottom lip for better coverage
-    return np.array(mouth_points, dtype=np.int32)
+        points.append((x, y))
+    # Also add inner lip points for better coverage
+    inner = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
+    for idx in inner:
+        x = int(landmarks.landmark[idx].x * w)
+        y = int(landmarks.landmark[idx].y * h)
+        points.append((x, y))
+    return np.array(points, dtype=np.int32)
 
-def warp_mouth_mediapipe(image, mouth_pts, open_ratio=0.5):
+def warp_mouth_pil(image_pil, mouth_pts, open_ratio=0.5):
     """
-    Warp the mouth region using affine transforms on the convex hull.
+    Warp the mouth region vertically using an affine stretch.
+    Returns a new PIL Image.
     """
     if mouth_pts is None or len(mouth_pts) < 6:
-        return image
-    # Compute bounding box of mouth
+        return image_pil
+    # Convert PIL to numpy for processing
+    img_np = np.array(image_pil.convert('RGB'))
+    h, w, _ = img_np.shape
+    # Compute mouth bounding box
     x_min = max(0, np.min(mouth_pts[:, 0]) - 5)
-    x_max = min(image.shape[1], np.max(mouth_pts[:, 0]) + 5)
+    x_max = min(w, np.max(mouth_pts[:, 0]) + 5)
     y_min = max(0, np.min(mouth_pts[:, 1]) - 5)
-    y_max = min(image.shape[0], np.max(mouth_pts[:, 1]) + 5)
+    y_max = min(h, np.max(mouth_pts[:, 1]) + 5)
     if x_max - x_min < 10 or y_max - y_min < 10:
-        return image
+        return image_pil
     # Crop mouth ROI
-    mouth_roi = image[y_min:y_max, x_min:x_max]
-    h, w = mouth_roi.shape[:2]
-    # Stretch vertically based on open_ratio (0=closed, 1=full open)
-    new_h = int(h * (0.3 + 0.7 * open_ratio))
+    mouth_roi = img_np[y_min:y_max, x_min:x_max]
+    roi_h, roi_w = mouth_roi.shape[:2]
+    # Stretch vertically: new height = roi_h * (0.3 + 0.7 * open_ratio)
+    new_h = int(roi_h * (0.3 + 0.7 * open_ratio))
     if new_h < 1:
         new_h = 1
-    stretched = cv2.resize(mouth_roi, (w, new_h), interpolation=cv2.INTER_LINEAR)
-    # Place back, centered vertically
-    y_offset = (h - new_h) // 2
-    result = image.copy()
-    result[y_min:y_min+new_h, x_min:x_max] = stretched[:new_h, :]
-    return result
-
-# ------------------------------------------------------------------
-# Wav2Lip – keep as optional (with proper import handling)
-# ------------------------------------------------------------------
-REPO_DIR = "wav2lip"
-MODEL_PATH = os.path.join(REPO_DIR, "wav2lip_gan.pth")
-CHECKPOINT_URL = "https://github.com/justinjohn0306/Wav2Lip/releases/download/Models/wav2lip_gan.pth"
-
-def download_wav2lip():
-    if not os.path.exists(REPO_DIR):
-        st.info("⏳ Cloning Wav2Lip repository...")
-        subprocess.run(["git", "clone", "https://github.com/Rudrabha/Wav2Lip.git", REPO_DIR], check=True)
-    if not os.path.exists(MODEL_PATH):
-        st.info("⏳ Downloading Wav2Lip model (≈300MB) – this will take a few minutes...")
-        import requests
-        response = requests.get(CHECKPOINT_URL, stream=True)
-        with open(MODEL_PATH, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        st.success("✅ Model ready.")
-
-def run_wav2lip(face_path, audio_path, output_path):
-    """Run Wav2Lip inference – install dependencies on the fly."""
-    # Ensure dependencies are installed
-    try:
-        import face_recognition
-        import librosa
-        import tensorflow
-    except ImportError:
-        st.info("Installing Wav2Lip dependencies... (this may take a minute)")
-        subprocess.run([sys.executable, "-m", "pip", "install", "face_recognition", "librosa", "tensorflow", "--no-cache-dir"], check=True)
-    req_file = os.path.join(REPO_DIR, "requirements.txt")
-    if os.path.exists(req_file):
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_file, "--no-cache-dir"], check=True)
-    cmd = [
-        sys.executable, os.path.join(REPO_DIR, "inference.py"),
-        "--checkpoint_path", MODEL_PATH,
-        "--face", face_path,
-        "--audio", audio_path,
-        "--outfile", output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        st.error(f"Wav2Lip error: {result.stderr}")
-        return False
-    return True
+    # Use PIL to resize (resize in PIL uses high-quality interpolation)
+    roi_pil = Image.fromarray(mouth_roi)
+    stretched = roi_pil.resize((roi_w, new_h), Image.Resampling.LANCZOS)
+    # Paste back into the image (centered vertically)
+    y_offset = (roi_h - new_h) // 2
+    result_pil = image_pil.copy()
+    result_pil.paste(stretched, (x_min, y_min + y_offset))
+    return result_pil
 
 # ------------------------------------------------------------------
 # MAIN GENERATE
@@ -182,38 +140,31 @@ if generate_btn:
     elif not script_text.strip():
         st.error("Please enter the text to speak.")
     else:
-        with st.spinner("🎬 Generating... (this may take a few minutes)"):
+        with st.spinner("🎬 Generating... (this may take a minute)"):
             try:
                 temp_dir = tempfile.mkdtemp()
-                face_path = os.path.join(temp_dir, "face.jpg")
-                with open(face_path, "wb") as f:
-                    f.write(uploaded_image.getvalue())
-
-                # 1. Generate speech audio
+                # 1. Save uploaded image as PIL
+                pil_img = Image.open(uploaded_image).convert('RGB')
+                # 2. Generate speech audio
                 audio_path = os.path.join(temp_dir, "speech.mp3")
                 async def tts():
                     communicate = edge_tts.Communicate(script_text, selected_voice)
                     await communicate.save(audio_path)
                 asyncio.run(tts())
 
-                # 2. Choose method
-                output_path = os.path.join(temp_dir, "output.mp4")
-                if method == "Wav2Lip (realistic, heavy)":
-                    download_wav2lip()
-                    success = run_wav2lip(face_path, audio_path, output_path)
-                    if not success:
-                        st.warning("Wav2Lip failed. Falling back to fast face‑warping.")
-                        method = "Face‑warping (fast, no download)"
-
-                if method == "Face‑warping (fast, no download)":
-                    st.info("Using fast face‑warping with MediaPipe landmarks.")
-                    # Get audio amplitude
-                    import moviepy.editor as mp
-                    audio_clip = mp.AudioFileClip(audio_path)
-                    framerate = audio_clip.fps if audio_clip.fps else 22050
-                    audio_array = audio_clip.to_soundarray(n_channels=1, fps=framerate)
-                    audio_array = audio_array.flatten()
-                    num_frames = 60
+                # 3. Detect mouth landmarks
+                mouth_points = get_mouth_points(pil_img)
+                if mouth_points is None:
+                    st.warning("No face landmarks detected. Using a simple mouth overlay.")
+                    # Use a fallback overlay (ellipse)
+                    frames = []
+                    audio_clip = mp_editor.AudioFileClip(audio_path)
+                    duration = audio_clip.duration
+                    num_frames = int(duration * 24)  # 24 fps
+                    # We'll still generate an audio-driven mouth overlay
+                    # For simplicity, we'll just use a constant open ratio
+                    # but we can compute amplitude from audio
+                    audio_array = audio_clip.to_soundarray(n_channels=1, fps=22050).flatten()
                     segment_len = max(1, len(audio_array) // num_frames)
                     amplitudes = []
                     for i in range(num_frames):
@@ -222,65 +173,72 @@ if generate_btn:
                         seg = audio_array[start:end]
                         rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
                         amplitudes.append(rms)
-                    max_amp = max(amplitudes) if max(amplitudes) > 0 else 1
+                    max_amp = max(amplitudes) if amplitudes else 1
                     amplitudes = [a / max_amp for a in amplitudes]
-
-                    # Load image and detect mouth landmarks
-                    img = cv2.imread(face_path)
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    mouth_pts = get_mouth_landmarks(face_path)
-                    if mouth_pts is None:
-                        st.warning("No face landmarks detected. Using simple mouth overlay.")
-                        # fallback overlay
-                        pil_img = Image.open(face_path).convert('RGBA')
-                        frames = []
-                        for amp in amplitudes:
-                            frame = pil_img.copy()
-                            draw = ImageDraw.Draw(frame)
-                            w, h = frame.size
-                            mouth_x = w//2 - 100
-                            mouth_y = h//2 + 80
-                            open_ratio = 0.2 + 0.8 * amp
-                            if open_ratio > 0.5:
-                                draw.ellipse((mouth_x, mouth_y, mouth_x+200, mouth_y+80), fill=(255,180,130,255), outline=(200,100,50,255))
-                            else:
-                                draw.line((mouth_x+20, mouth_y+40, mouth_x+180, mouth_y+40), fill=(255,200,150,255), width=6)
-                            frames.append(np.array(frame))
-                    else:
-                        frames = []
-                        for amp in amplitudes:
-                            open_ratio = 0.2 + 0.8 * amp
-                            warped = warp_mouth_mediapipe(img_rgb, mouth_pts, open_ratio)
-                            frames.append(warped)
-                    # Create video
-                    clips = [mp.ImageClip(frame).set_duration(1/24) for frame in frames]
-                    video = mp.concatenate_videoclips(clips, method="chain")
-                    audio = mp.AudioFileClip(audio_path)
-                    video = video.set_audio(audio)
-                    video.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac', verbose=False, logger=None)
-
-                # Display and download
-                if os.path.exists(output_path):
-                    with open(output_path, "rb") as f:
-                        video_bytes = f.read()
-                    b64 = base64.b64encode(video_bytes).decode()
-                    video_html = f"""
-                    <video width="100%" controls autoplay>
-                        <source src="data:video/mp4;base64,{b64}" type="video/mp4">
-                    </video>
-                    """
-                    video_placeholder.markdown(video_html, unsafe_allow_html=True)
-                    st.download_button("⬇️ Download Video (MP4)", video_bytes,
-                                       file_name="talking_head.mp4", mime="video/mp4",
-                                       use_container_width=True)
+                    # Create frames with overlay
+                    base_img = pil_img.copy()
+                    w, h = base_img.size
+                    for amp in amplitudes:
+                        frame = base_img.copy()
+                        draw = ImageDraw.Draw(frame)
+                        open_ratio = 0.2 + 0.8 * amp
+                        mouth_x = w//2 - 100
+                        mouth_y = h//2 + 80
+                        if open_ratio > 0.5:
+                            draw.ellipse((mouth_x, mouth_y, mouth_x+200, mouth_y+80), fill=(255,180,130,255), outline=(200,100,50,255))
+                        else:
+                            draw.line((mouth_x+20, mouth_y+40, mouth_x+180, mouth_y+40), fill=(255,200,150,255), width=6)
+                        frames.append(np.array(frame))
                 else:
-                    st.error("Video generation failed.")
+                    # Use mediapipe warping
+                    audio_clip = mp_editor.AudioFileClip(audio_path)
+                    duration = audio_clip.duration
+                    num_frames = int(duration * 24)  # 24 fps
+                    audio_array = audio_clip.to_soundarray(n_channels=1, fps=22050).flatten()
+                    segment_len = max(1, len(audio_array) // num_frames)
+                    amplitudes = []
+                    for i in range(num_frames):
+                        start = i * segment_len
+                        end = min(start + segment_len, len(audio_array))
+                        seg = audio_array[start:end]
+                        rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
+                        amplitudes.append(rms)
+                    max_amp = max(amplitudes) if amplitudes else 1
+                    amplitudes = [a / max_amp for a in amplitudes]
+                    frames = []
+                    for amp in amplitudes:
+                        open_ratio = 0.2 + 0.8 * amp
+                        warped = warp_mouth_pil(pil_img, mouth_points, open_ratio)
+                        frames.append(np.array(warped))
+
+                # 4. Create video from frames
+                clips = [mp_editor.ImageClip(frame).set_duration(1/24) for frame in frames]
+                video = mp_editor.concatenate_videoclips(clips, method="chain")
+                audio = mp_editor.AudioFileClip(audio_path)
+                video = video.set_audio(audio)
+                output_path = os.path.join(temp_dir, "output.mp4")
+                video.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac',
+                                      verbose=False, logger=None)
+
+                # 5. Display and download
+                with open(output_path, "rb") as f:
+                    video_bytes = f.read()
+                b64 = base64.b64encode(video_bytes).decode()
+                video_html = f"""
+                <video width="100%" controls autoplay>
+                    <source src="data:video/mp4;base64,{b64}" type="video/mp4">
+                </video>
+                """
+                video_placeholder.markdown(video_html, unsafe_allow_html=True)
+                st.download_button("⬇️ Download Video (MP4)", video_bytes,
+                                   file_name="talking_head.mp4", mime="video/mp4",
+                                   use_container_width=True)
+                # Cleanup
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
             except Exception as e:
                 st.error(f"An error occurred: {e}")
                 st.exception(e)
-            finally:
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir, ignore_errors=True)
 
 st.markdown("---")
 st.caption("Built by Gesner Deslandes | GlobalInternet.py")
