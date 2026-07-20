@@ -84,21 +84,18 @@ def draw_mouth(draw, center_x, center_y, width, height, open_ratio=0.0, color=(2
     """
     if open_ratio < 0.05:
         # Closed mouth: a horizontal line with a slight curve
-        y1 = center_y
-        y2 = center_y
-        draw.line((center_x - width//2, y1, center_x + width//2, y2), fill=color, width=4)
-        # Add a small shadow under the line
-        draw.line((center_x - width//2, y1+2, center_x + width//2, y2+2), fill=(100,70,60), width=2)
+        draw.line((center_x - width//2, center_y, center_x + width//2, center_y), fill=color, width=4)
+        draw.line((center_x - width//2, center_y+2, center_x + width//2, center_y+2), fill=(100,70,60), width=2)
         return
     # Open mouth: an ellipse that becomes more oval as it opens
     current_height = int(height * (0.2 + 0.8 * open_ratio))
-    # Draw a black background for depth
+    # Dark inner background
     draw.ellipse(
         (center_x - width//2, center_y - current_height//2,
          center_x + width//2, center_y + current_height//2),
-        fill=(50, 30, 20, 200)  # dark inner
+        fill=(50, 30, 20, 200)
     )
-    # Draw the lips (outer ellipse)
+    # Lips (outer ellipse)
     draw.ellipse(
         (center_x - width//2 - 2, center_y - current_height//2 - 2,
          center_x + width//2 + 2, center_y + current_height//2 + 2),
@@ -126,7 +123,7 @@ def generate_video(image_path, script, voice, output_path, offset_x=0, offset_y=
 
     # Estimate face center (assuming portrait: face is roughly in the upper half)
     face_center_x = w // 2
-    face_center_y = int(h * 0.35)  # typically eyes are at 1/3 from top
+    face_center_y = int(h * 0.35)  # eyes at ~1/3 from top
 
     # Mouth position (below face center)
     mouth_x = face_center_x + offset_x
@@ -140,22 +137,28 @@ def generate_video(image_path, script, voice, output_path, offset_x=0, offset_y=
     audio_clip = mp.AudioFileClip(audio_path)
     duration = audio_clip.duration
     num_frames = max(1, int(duration * 24))  # 24 fps
-    audio_array = audio_clip.to_soundarray(n_channels=1, fps=22050).flatten()
-    segment_len = max(1, len(audio_array) // num_frames)
-    amplitudes = []
-    for i in range(num_frames):
-        start = i * segment_len
-        end = min(start + segment_len, len(audio_array))
-        seg = audio_array[start:end]
-        rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
-        amplitudes.append(rms)
-    max_amp = max(amplitudes) if amplitudes else 1
-    amplitudes = [a / max_amp for a in amplitudes]
+
+    # Extract audio as mono array (average channels)
+    audio_array = audio_clip.to_soundarray(fps=22050).mean(axis=1)
+    if len(audio_array) == 0:
+        # Fallback: use a simple sine wave for demonstration
+        audio_array = np.sin(2 * np.pi * 5 * np.arange(num_frames * 24) / 24) * 0.5 + 0.5
+    else:
+        # Resample to match num_frames
+        # We'll take segments to get amplitude per frame
+        segment_len = max(1, len(audio_array) // num_frames)
+        amplitudes = []
+        for i in range(num_frames):
+            start = i * segment_len
+            end = min(start + segment_len, len(audio_array))
+            seg = audio_array[start:end]
+            rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
+            amplitudes.append(rms)
+        max_amp = max(amplitudes) if amplitudes else 1
+        amplitudes = [a / max_amp for a in amplitudes]
 
     # 4. Generate frames
     frames = []
-    # Skin tone approximation – we'll use the average color of the face area
-    # For simplicity, we'll just use a fixed warm tone; can be improved.
     lip_color = (200, 150, 130)  # default
     for amp in amplitudes:
         open_ratio = min(1.0, amp * 1.5)  # amplify a bit for more movement
@@ -171,7 +174,6 @@ def generate_video(image_path, script, voice, output_path, offset_x=0, offset_y=
     video = video.set_audio(audio)
     video.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac',
                           verbose=False, logger=None)
-    # Cleanup
     os.remove(audio_path)
     return output_path
 
