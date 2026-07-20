@@ -2,7 +2,6 @@ import streamlit as st
 import os
 import tempfile
 import time
-import asyncio
 import requests
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
@@ -11,9 +10,7 @@ from moviepy.editor import ImageSequenceClip, AudioFileClip, CompositeVideoClip,
 import base64
 import uuid
 import io
-import json
 import random
-import colorsys
 
 # Page config
 st.set_page_config(
@@ -146,9 +143,11 @@ video_placeholder = st.empty()
 
 # ---- Enhanced placeholder generation ----
 def generate_placeholder(prompt, size=(1920,1080)):
+    """Generate a professional-looking gradient image with geometric elements and text."""
     img = Image.new('RGB', size)
     draw = ImageDraw.Draw(img)
     
+    # Random color palettes
     palettes = [
         ((20,40,80), (80,20,120)),
         ((10,60,40), (100,40,20)),
@@ -158,6 +157,7 @@ def generate_placeholder(prompt, size=(1920,1080)):
     ]
     color1, color2 = random.choice(palettes)
     
+    # Smooth vertical gradient
     for y in range(size[1]):
         ratio = y / size[1]
         r = int(color1[0] * (1 - ratio) + color2[0] * ratio)
@@ -165,24 +165,27 @@ def generate_placeholder(prompt, size=(1920,1080)):
         b = int(color1[2] * (1 - ratio) + color2[2] * ratio)
         draw.line([(0, y), (size[0], y)], fill=(r, g, b))
     
-    # Geometric shapes
-    shapes = [
-        ('circle', (size[0]//2, size[1]//2), size[0]//3),
-        ('circle', (size[0]//4, size[1]//4), size[0]//6),
-        ('circle', (3*size[0]//4, 3*size[1]//4), size[0]//5),
-        ('rectangle', (size[0]//10, size[1]//10, size[0]-size[0]//10, size[1]-size[1]//10)),
+    # Draw semi-transparent circles
+    circle_centers = [
+        (size[0]//2, size[1]//2),
+        (size[0]//4, size[1]//4),
+        (3*size[0]//4, 3*size[1]//4)
     ]
-    for shape in shapes:
-        if shape[0] == 'circle':
-            x, y, r = shape[1], shape[2], shape[3]
-            overlay = Image.new('RGBA', size, (0,0,0,0))
-            overlay_draw = ImageDraw.Draw(overlay)
-            overlay_draw.ellipse((x-r, y-r, x+r, y+r), fill=(255,255,255,20))
-            img = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
-        elif shape[0] == 'rectangle':
-            draw.rectangle(shape[1], outline=(255,255,255,30), width=3)
+    radii = [size[0]//3, size[0]//6, size[0]//5]
+    for center, radius in zip(circle_centers, radii):
+        overlay = Image.new('RGBA', size, (0,0,0,0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        overlay_draw.ellipse(
+            (center[0]-radius, center[1]-radius, center[0]+radius, center[1]+radius),
+            fill=(255,255,255,20)
+        )
+        img = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
     
-    # Large text
+    # Draw a thin border rectangle
+    rect = (size[0]//10, size[1]//10, size[0]-size[0]//10, size[1]-size[1]//10)
+    draw.rectangle(rect, outline=(255,255,255,30), width=3)
+    
+    # Large, bold text
     try:
         font = ImageFont.truetype("Arial", 100)
     except:
@@ -214,6 +217,7 @@ def generate_placeholder(prompt, size=(1920,1080)):
         bbox = draw.textbbox((0,0), line, font=font)
         w = bbox[2] - bbox[0]
         x_text = (size[0] - w) // 2
+        # Black stroke
         for dx in (-3,0,3):
             for dy in (-3,0,3):
                 draw.text((x_text+dx, y_text+dy), line, font=font, fill='black')
@@ -316,7 +320,11 @@ def generate_image_hf(prompt, token, model):
 def generate_image_replicate(prompt, token, model):
     if not token:
         return None
-    import replicate
+    try:
+        import replicate
+    except ImportError:
+        st.warning("Replicate not installed. Install with: pip install replicate")
+        return None
     os.environ["REPLICATE_API_TOKEN"] = token
     try:
         if "stable-diffusion" in model or "FLUX" in model:
@@ -379,7 +387,7 @@ if generate_btn:
                                 try:
                                     img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
                                     img_data = img
-                                except:
+                                except Exception as e:
                                     pass
                         else:
                             img_url = generate_image_replicate(prompt, replicate_key, replicate_model)
@@ -389,7 +397,7 @@ if generate_btn:
                                     if resp.status_code == 200:
                                         img = Image.open(io.BytesIO(resp.content)).convert('RGB')
                                         img_data = img
-                                except:
+                                except Exception as e:
                                     pass
                         if img_data is None:
                             st.warning(f"Using placeholder for prompt {i+1} due to API failure.")
