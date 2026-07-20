@@ -5,12 +5,10 @@ import asyncio
 import edge_tts
 import numpy as np
 import base64
-import uuid
 import shutil
-import math
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 import moviepy.editor as mp
-from pydub import AudioSegment
+import librosa
 
 # Page config
 st.set_page_config(page_title="AI Talking Head", page_icon="🎭", layout="wide")
@@ -79,7 +77,6 @@ video_placeholder = st.empty()
 # ------------------------------------------------------------------
 
 def draw_mouth(draw, center_x, center_y, width, height, open_ratio=0.0, color=(200, 150, 130)):
-    """Draw a semi‑realistic mouth."""
     if open_ratio < 0.05:
         draw.line((center_x - width//2, center_y, center_x + width//2, center_y), fill=color, width=4)
         draw.line((center_x - width//2, center_y+2, center_x + width//2, center_y+2), fill=(100,70,60), width=2)
@@ -121,43 +118,51 @@ def generate_video(image_path, script, voice, output_path, offset_x=0, offset_y=
     base_width = int(w * 0.15 * mouth_scale)
     base_height = int(w * 0.06 * mouth_scale)
 
-    # 3. Extract audio amplitude using pydub (reliable)
-    audio_seg = AudioSegment.from_mp3(audio_path)
-    # Convert to mono
-    audio_seg = audio_seg.set_channels(1)
-    # Get raw data as numpy array
-    samples = np.array(audio_seg.get_array_of_samples())
-    # Normalize to -1..1
-    samples = samples / (2.0 ** (8 * audio_seg.sample_width - 1))
-    # Resample to target frame rate (24 fps)
-    target_fps = 24
-    duration = len(samples) / audio_seg.frame_rate
-    num_frames = max(1, int(duration * target_fps))
-    segment_len = max(1, len(samples) // num_frames)
-    amplitudes = []
-    for i in range(num_frames):
-        start = i * segment_len
-        end = min(start + segment_len, len(samples))
-        seg = samples[start:end]
-        rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
-        amplitudes.append(rms)
-    max_amp = max(amplitudes) if amplitudes else 1
-    amplitudes = [a / max_amp for a in amplitudes]
+    # 3. Extract amplitude using librosa (robust)
+    try:
+        y, sr = librosa.load(audio_path, sr=None, mono=True)
+        # Envelope: RMS per frame of about 1/24 sec
+        hop_length = int(sr / 24)  # one frame per video frame
+        rms = librosa.feature.rms(y=y, frame_length=2*hop_length, hop_length=hop_length)[0]
+        # Convert to list of amplitudes (0-1 normalized)
+        max_rms = max(rms) if len(rms) > 0 else 1
+        amplitudes = rms / max_rms if max_rms > 0 else np.ones_like(rms) * 0.5
+    except Exception as e:
+        # Fallback: generate a simple sine wave
+        st.warning(f"Audio analysis failed: {e}. Using synthetic waveform.")
+        duration = 5  # assume 5 seconds
+        num_frames = int(duration * 24)
+        t = np.linspace(0, duration, num_frames)
+        amplitudes = 0.5 + 0.5 * np.sin(2 * np.pi * 2 * t)  # 2 Hz
+        amplitudes = np.clip(amplitudes, 0, 1)
+
+    # Ensure we have at least 1 frame
+    if len(amplitudes) == 0:
+        amplitudes = np.array([0.5])
 
     # 4. Generate frames
     frames = []
     lip_color = (200, 150, 130)
     for amp in amplitudes:
-        open_ratio = min(1.0, amp * 1.5)
+        open_ratio = min(1.0, amp * 1.5)  # amplify a bit
         frame = img.copy()
         draw = ImageDraw.Draw(frame, 'RGBA')
         draw_mouth(draw, mouth_x, mouth_y, base_width, base_height, open_ratio, lip_color)
         frames.append(np.array(frame.convert('RGB')))
 
     # 5. Create video
+    # If frames list is empty, create a single frame
+    if not frames:
+        frames.append(np.array(img.convert('RGB')))
     clips = [mp.ImageClip(frame).set_duration(1/24) for frame in frames]
     video = mp.concatenate_videoclips(clips, method="chain")
     audio = mp.AudioFileClip(audio_path)
+    # If video duration is shorter than audio, loop or extend
+    if video.duration < audio.duration:
+        # Loop the video to match audio length
+        video = video.loop(duration=audio.duration)
+    elif video.duration > audio.duration:
+        video = video.subclip(0, audio.duration)
     video = video.set_audio(audio)
     video.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac',
                           verbose=False, logger=None)
