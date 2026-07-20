@@ -9,8 +9,7 @@ import uuid
 import shutil
 import math
 from PIL import Image, ImageDraw, ImageFont
-import mediapipe as mp
-import moviepy.editor as mp_editor
+import moviepy.editor as mp
 
 # Page config
 st.set_page_config(page_title="AI Talking Head", page_icon="🎭", layout="wide")
@@ -24,7 +23,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<h1 style="text-align:center;">🎭 AI Talking Head Generator</h1>', unsafe_allow_html=True)
-st.markdown('<p style="text-align:center;">Upload a portrait – the app animates the mouth naturally using AI (no OpenCV needed).</p>', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center;">Upload a portrait – the mouth moves naturally with the audio.</p>', unsafe_allow_html=True)
 
 # Sidebar
 with st.sidebar:
@@ -45,6 +44,13 @@ with st.sidebar:
     }
     selected_voice = voice_map.get((voice_lang, voice_gender), "en-US-JennyNeural")
     st.info(f"Voice: {selected_voice}")
+
+    st.markdown("---")
+    st.subheader("Mouth Position")
+    offset_x = st.slider("Horizontal offset", -100, 100, 0, help="Move mouth left/right")
+    offset_y = st.slider("Vertical offset", -100, 100, 20, help="Move mouth up/down")
+    mouth_scale = st.slider("Mouth size", 0.5, 2.0, 1.0, step=0.1, help="Scale of the mouth")
+
     st.markdown("---")
     st.markdown("""
     <div class="contact-info">
@@ -68,68 +74,106 @@ with col2:
 video_placeholder = st.empty()
 
 # ------------------------------------------------------------------
-# MediaPipe Face Mesh – get mouth landmarks (no cv2)
+# Core functions (no cv2, no mediapipe)
 # ------------------------------------------------------------------
-mp_face_mesh = mp.solutions.face_mesh
 
-def get_mouth_points(image_pil):
-    """Detect mouth contour using MediaPipe, return list of (x,y) points in pixel coords."""
-    # Convert PIL to RGB numpy array (MediaPipe expects RGB)
-    img_rgb = np.array(image_pil.convert('RGB'))
-    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, min_detection_confidence=0.5) as face_mesh:
-        results = face_mesh.process(img_rgb)
-    if not results.multi_face_landmarks:
-        return None
-    landmarks = results.multi_face_landmarks[0]
-    h, w, _ = img_rgb.shape
-    # We'll collect outer mouth points (indices from MediaPipe Face Mesh)
-    # Use a comprehensive set that forms a closed loop
-    mouth_indices = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
-    points = []
-    for idx in mouth_indices:
-        x = int(landmarks.landmark[idx].x * w)
-        y = int(landmarks.landmark[idx].y * h)
-        points.append((x, y))
-    # Also add inner lip points for better coverage
-    inner = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
-    for idx in inner:
-        x = int(landmarks.landmark[idx].x * w)
-        y = int(landmarks.landmark[idx].y * h)
-        points.append((x, y))
-    return np.array(points, dtype=np.int32)
+def draw_mouth(draw, center_x, center_y, width, height, open_ratio=0.0, color=(200, 150, 130)):
+    """
+    Draw a semi‑realistic mouth at the given position.
+    open_ratio: 0 = closed (thin line), 1 = fully open (ellipse)
+    """
+    if open_ratio < 0.05:
+        # Closed mouth: a horizontal line with a slight curve
+        y1 = center_y
+        y2 = center_y
+        draw.line((center_x - width//2, y1, center_x + width//2, y2), fill=color, width=4)
+        # Add a small shadow under the line
+        draw.line((center_x - width//2, y1+2, center_x + width//2, y2+2), fill=(100,70,60), width=2)
+        return
+    # Open mouth: an ellipse that becomes more oval as it opens
+    current_height = int(height * (0.2 + 0.8 * open_ratio))
+    # Draw a black background for depth
+    draw.ellipse(
+        (center_x - width//2, center_y - current_height//2,
+         center_x + width//2, center_y + current_height//2),
+        fill=(50, 30, 20, 200)  # dark inner
+    )
+    # Draw the lips (outer ellipse)
+    draw.ellipse(
+        (center_x - width//2 - 2, center_y - current_height//2 - 2,
+         center_x + width//2 + 2, center_y + current_height//2 + 2),
+        outline=(color[0], color[1], color[2], 255), width=3
+    )
+    # Inner bright area (tongue hint)
+    if current_height > 10:
+        draw.ellipse(
+            (center_x - width//3, center_y - current_height//4,
+             center_x + width//3, center_y + current_height//4),
+            fill=(210, 160, 120, 150)
+        )
 
-def warp_mouth_pil(image_pil, mouth_pts, open_ratio=0.5):
-    """
-    Warp the mouth region vertically using an affine stretch.
-    Returns a new PIL Image.
-    """
-    if mouth_pts is None or len(mouth_pts) < 6:
-        return image_pil
-    # Convert PIL to numpy for processing
-    img_np = np.array(image_pil.convert('RGB'))
-    h, w, _ = img_np.shape
-    # Compute mouth bounding box
-    x_min = max(0, np.min(mouth_pts[:, 0]) - 5)
-    x_max = min(w, np.max(mouth_pts[:, 0]) + 5)
-    y_min = max(0, np.min(mouth_pts[:, 1]) - 5)
-    y_max = min(h, np.max(mouth_pts[:, 1]) + 5)
-    if x_max - x_min < 10 or y_max - y_min < 10:
-        return image_pil
-    # Crop mouth ROI
-    mouth_roi = img_np[y_min:y_max, x_min:x_max]
-    roi_h, roi_w = mouth_roi.shape[:2]
-    # Stretch vertically: new height = roi_h * (0.3 + 0.7 * open_ratio)
-    new_h = int(roi_h * (0.3 + 0.7 * open_ratio))
-    if new_h < 1:
-        new_h = 1
-    # Use PIL to resize (resize in PIL uses high-quality interpolation)
-    roi_pil = Image.fromarray(mouth_roi)
-    stretched = roi_pil.resize((roi_w, new_h), Image.Resampling.LANCZOS)
-    # Paste back into the image (centered vertically)
-    y_offset = (roi_h - new_h) // 2
-    result_pil = image_pil.copy()
-    result_pil.paste(stretched, (x_min, y_min + y_offset))
-    return result_pil
+def generate_video(image_path, script, voice, output_path, offset_x=0, offset_y=20, mouth_scale=1.0):
+    # 1. Generate speech audio
+    audio_path = tempfile.mktemp(suffix=".mp3")
+    async def tts():
+        communicate = edge_tts.Communicate(script, voice)
+        await communicate.save(audio_path)
+    asyncio.run(tts())
+
+    # 2. Load image
+    img = Image.open(image_path).convert('RGBA')
+    w, h = img.size
+
+    # Estimate face center (assuming portrait: face is roughly in the upper half)
+    face_center_x = w // 2
+    face_center_y = int(h * 0.35)  # typically eyes are at 1/3 from top
+
+    # Mouth position (below face center)
+    mouth_x = face_center_x + offset_x
+    mouth_y = face_center_y + int(h * 0.2) + offset_y
+
+    # Mouth dimensions (scaled)
+    base_width = int(w * 0.15 * mouth_scale)
+    base_height = int(w * 0.06 * mouth_scale)
+
+    # 3. Get audio amplitude
+    audio_clip = mp.AudioFileClip(audio_path)
+    duration = audio_clip.duration
+    num_frames = max(1, int(duration * 24))  # 24 fps
+    audio_array = audio_clip.to_soundarray(n_channels=1, fps=22050).flatten()
+    segment_len = max(1, len(audio_array) // num_frames)
+    amplitudes = []
+    for i in range(num_frames):
+        start = i * segment_len
+        end = min(start + segment_len, len(audio_array))
+        seg = audio_array[start:end]
+        rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
+        amplitudes.append(rms)
+    max_amp = max(amplitudes) if amplitudes else 1
+    amplitudes = [a / max_amp for a in amplitudes]
+
+    # 4. Generate frames
+    frames = []
+    # Skin tone approximation – we'll use the average color of the face area
+    # For simplicity, we'll just use a fixed warm tone; can be improved.
+    lip_color = (200, 150, 130)  # default
+    for amp in amplitudes:
+        open_ratio = min(1.0, amp * 1.5)  # amplify a bit for more movement
+        frame = img.copy()
+        draw = ImageDraw.Draw(frame, 'RGBA')
+        draw_mouth(draw, mouth_x, mouth_y, base_width, base_height, open_ratio, lip_color)
+        frames.append(np.array(frame.convert('RGB')))
+
+    # 5. Create video
+    clips = [mp.ImageClip(frame).set_duration(1/24) for frame in frames]
+    video = mp.concatenate_videoclips(clips, method="chain")
+    audio = mp.AudioFileClip(audio_path)
+    video = video.set_audio(audio)
+    video.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac',
+                          verbose=False, logger=None)
+    # Cleanup
+    os.remove(audio_path)
+    return output_path
 
 # ------------------------------------------------------------------
 # MAIN GENERATE
@@ -140,87 +184,25 @@ if generate_btn:
     elif not script_text.strip():
         st.error("Please enter the text to speak.")
     else:
-        with st.spinner("🎬 Generating... (this may take a minute)"):
+        with st.spinner("🎬 Generating video... (this may take a minute)"):
             try:
                 temp_dir = tempfile.mkdtemp()
-                # 1. Save uploaded image as PIL
-                pil_img = Image.open(uploaded_image).convert('RGB')
-                # 2. Generate speech audio
-                audio_path = os.path.join(temp_dir, "speech.mp3")
-                async def tts():
-                    communicate = edge_tts.Communicate(script_text, selected_voice)
-                    await communicate.save(audio_path)
-                asyncio.run(tts())
-
-                # 3. Detect mouth landmarks
-                mouth_points = get_mouth_points(pil_img)
-                if mouth_points is None:
-                    st.warning("No face landmarks detected. Using a simple mouth overlay.")
-                    # Use a fallback overlay (ellipse)
-                    frames = []
-                    audio_clip = mp_editor.AudioFileClip(audio_path)
-                    duration = audio_clip.duration
-                    num_frames = int(duration * 24)  # 24 fps
-                    # We'll still generate an audio-driven mouth overlay
-                    # For simplicity, we'll just use a constant open ratio
-                    # but we can compute amplitude from audio
-                    audio_array = audio_clip.to_soundarray(n_channels=1, fps=22050).flatten()
-                    segment_len = max(1, len(audio_array) // num_frames)
-                    amplitudes = []
-                    for i in range(num_frames):
-                        start = i * segment_len
-                        end = min(start + segment_len, len(audio_array))
-                        seg = audio_array[start:end]
-                        rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
-                        amplitudes.append(rms)
-                    max_amp = max(amplitudes) if amplitudes else 1
-                    amplitudes = [a / max_amp for a in amplitudes]
-                    # Create frames with overlay
-                    base_img = pil_img.copy()
-                    w, h = base_img.size
-                    for amp in amplitudes:
-                        frame = base_img.copy()
-                        draw = ImageDraw.Draw(frame)
-                        open_ratio = 0.2 + 0.8 * amp
-                        mouth_x = w//2 - 100
-                        mouth_y = h//2 + 80
-                        if open_ratio > 0.5:
-                            draw.ellipse((mouth_x, mouth_y, mouth_x+200, mouth_y+80), fill=(255,180,130,255), outline=(200,100,50,255))
-                        else:
-                            draw.line((mouth_x+20, mouth_y+40, mouth_x+180, mouth_y+40), fill=(255,200,150,255), width=6)
-                        frames.append(np.array(frame))
-                else:
-                    # Use mediapipe warping
-                    audio_clip = mp_editor.AudioFileClip(audio_path)
-                    duration = audio_clip.duration
-                    num_frames = int(duration * 24)  # 24 fps
-                    audio_array = audio_clip.to_soundarray(n_channels=1, fps=22050).flatten()
-                    segment_len = max(1, len(audio_array) // num_frames)
-                    amplitudes = []
-                    for i in range(num_frames):
-                        start = i * segment_len
-                        end = min(start + segment_len, len(audio_array))
-                        seg = audio_array[start:end]
-                        rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
-                        amplitudes.append(rms)
-                    max_amp = max(amplitudes) if amplitudes else 1
-                    amplitudes = [a / max_amp for a in amplitudes]
-                    frames = []
-                    for amp in amplitudes:
-                        open_ratio = 0.2 + 0.8 * amp
-                        warped = warp_mouth_pil(pil_img, mouth_points, open_ratio)
-                        frames.append(np.array(warped))
-
-                # 4. Create video from frames
-                clips = [mp_editor.ImageClip(frame).set_duration(1/24) for frame in frames]
-                video = mp_editor.concatenate_videoclips(clips, method="chain")
-                audio = mp_editor.AudioFileClip(audio_path)
-                video = video.set_audio(audio)
+                # Save uploaded image
+                image_path = os.path.join(temp_dir, "input.jpg")
+                img = Image.open(uploaded_image).convert('RGB')
+                img.save(image_path)
+                # Generate video
                 output_path = os.path.join(temp_dir, "output.mp4")
-                video.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac',
-                                      verbose=False, logger=None)
-
-                # 5. Display and download
+                generate_video(
+                    image_path,
+                    script_text,
+                    selected_voice,
+                    output_path,
+                    offset_x,
+                    offset_y,
+                    mouth_scale
+                )
+                # Display and download
                 with open(output_path, "rb") as f:
                     video_bytes = f.read()
                 b64 = base64.b64encode(video_bytes).decode()
@@ -235,7 +217,6 @@ if generate_btn:
                                    use_container_width=True)
                 # Cleanup
                 shutil.rmtree(temp_dir, ignore_errors=True)
-
             except Exception as e:
                 st.error(f"An error occurred: {e}")
                 st.exception(e)
