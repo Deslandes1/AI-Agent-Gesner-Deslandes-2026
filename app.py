@@ -71,21 +71,26 @@ with st.sidebar:
     
     # Image source selection
     image_source = st.radio("Image Source", 
-                            ["Generate with Hugging Face", "Generate with Replicate", "Upload your own images"],
-                            help="Hugging Face is free with a token; Replicate requires credits; Upload uses your own images.")
+                            ["Generate with Hugging Face", 
+                             "Generate with Replicate", 
+                             "Upload your own images",
+                             "Placeholder images (no API required)"],
+                            help="Placeholder images work without any API key.")
     
     if image_source == "Generate with Hugging Face":
         hf_token = st.text_input("Hugging Face API Token", type="password", 
                                  placeholder="Get token from huggingface.co/settings/tokens",
                                  help="Free; get a token from huggingface.co")
-        hf_model = st.selectbox("Model", ["stabilityai/stable-diffusion-2-1", "runwayml/stable-diffusion-v1-5"])
+        hf_model = st.selectbox("Model", ["runwayml/stable-diffusion-v1-5", "stabilityai/stable-diffusion-2-1"])
     elif image_source == "Generate with Replicate":
         replicate_key = st.text_input("Replicate API Key", type="password", 
                                       placeholder="Get key from replicate.com/account/api-tokens",
                                       help="Requires credits. See replicate.com/pricing")
         replicate_model = st.selectbox("Model", ["stability-ai/stable-diffusion-3.5-large", "black-forest-labs/FLUX.1-dev"])
-    else:
+    elif image_source == "Upload your own images":
         st.info("You will upload images in the main area.")
+    else:
+        st.info("Placeholder images will be generated with gradient backgrounds and your prompt text.")
     
     st.markdown("---")
     st.subheader("Video Settings")
@@ -114,7 +119,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
 # Main area
-st.subheader("📝 Prompts for Images (if generating)")
+st.subheader("📝 Prompts for Images")
 st.caption("Enter one prompt per line. Each prompt will generate a slide.")
 prompts_text = st.text_area("Prompts", height=200, 
                             placeholder="e.g.\nA modern money transfer app on a smartphone\nA family receiving money in Haiti\nA fast digital payment interface\nA happy customer using mobile money")
@@ -140,23 +145,79 @@ with col2:
 video_placeholder = st.empty()
 
 # Helper functions
+def generate_placeholder(prompt, size=(1920,1080)):
+    """Generate a gradient placeholder image with prompt text."""
+    # Create a colorful gradient
+    img = Image.new('RGB', size)
+    draw = ImageDraw.Draw(img)
+    # Gradient from dark blue to purple
+    for y in range(size[1]):
+        ratio = y / size[1]
+        r = int(20 + 50 * ratio)
+        g = int(40 + 30 * ratio)
+        b = int(80 + 100 * ratio)
+        draw.line([(0, y), (size[0], y)], fill=(r, g, b))
+    # Draw prompt text
+    try:
+        font = ImageFont.truetype("Arial", 60)
+    except:
+        font = ImageFont.load_default()
+    # Wrap text
+    max_width = size[0] - 100
+    lines = []
+    words = prompt.split()
+    if words:
+        line = ""
+        for word in words:
+            test_line = line + word + " "
+            bbox = draw.textbbox((0,0), test_line, font=font)
+            w = bbox[2] - bbox[0]
+            if w <= max_width:
+                line = test_line
+            else:
+                if line:
+                    lines.append(line.strip())
+                line = word + " "
+        if line:
+            lines.append(line.strip())
+    total_height = 0
+    for line in lines:
+        bbox = draw.textbbox((0,0), line, font=font)
+        total_height += bbox[3] - bbox[1]
+    total_height += (len(lines) - 1) * 10
+    y_text = (size[1] - total_height) // 2
+    for line in lines:
+        bbox = draw.textbbox((0,0), line, font=font)
+        w = bbox[2] - bbox[0]
+        x_text = (size[0] - w) // 2
+        draw.text((x_text, y_text), line, font=font, fill='white')
+        y_text += bbox[3] + 10
+    return img
+
 def generate_image_hf(prompt, token, model):
-    """Generate an image using Hugging Face inference API."""
+    """Generate an image using Hugging Face inference API with retry."""
     if not token:
         return None
     API_URL = f"https://api-inference.huggingface.co/models/{model}"
     headers = {"Authorization": f"Bearer {token}"}
     payload = {"inputs": prompt}
-    try:
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
-        if response.status_code == 200:
-            return response.content  # returns raw image bytes
-        else:
-            st.error(f"Hugging Face error {response.status_code}: {response.text}")
-            return None
-    except Exception as e:
-        st.error(f"HF API error: {e}")
-        return None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                return response.content
+            elif response.status_code == 503:
+                # Model loading, wait and retry
+                time.sleep(5)
+                continue
+            else:
+                st.warning(f"HF attempt {attempt+1} failed: {response.status_code}")
+                time.sleep(2)
+        except Exception as e:
+            st.warning(f"HF attempt {attempt+1} error: {e}")
+            time.sleep(2)
+    return None
 
 def generate_image_replicate(prompt, token, model):
     """Generate an image using Replicate."""
@@ -165,20 +226,19 @@ def generate_image_replicate(prompt, token, model):
     import replicate
     os.environ["REPLICATE_API_TOKEN"] = token
     try:
-        # Model-specific input
         if "stable-diffusion" in model or "FLUX" in model:
             input = {"prompt": prompt, "aspect_ratio": "16:9", "output_format": "png"}
         else:
             input = {"prompt": prompt, "num_inference_steps": 30, "guidance_scale": 7.5}
         output = replicate.run(model, input=input)
         if isinstance(output, list):
-            return output[0]  # URL
+            return output[0]
         elif isinstance(output, str):
             return output
         else:
             return None
     except Exception as e:
-        st.error(f"Replicate error: {e}")
+        st.warning(f"Replicate error: {e}")
         return None
 
 def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=(1920,1080)):
@@ -223,7 +283,6 @@ def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=
             bbox = draw.textbbox((0,0), line, font=font)
             w = bbox[2] - bbox[0]
             x_text = (size[0] - w) // 2
-            # Black stroke
             for dx in (-2,0,2):
                 for dy in (-2,0,2):
                     draw.text((x_text+dx, y_text+dy), line, font=font, fill='black')
@@ -255,46 +314,64 @@ def create_video(image_list, durations, output_path, music_path=None, transition
 # Generate logic
 if generate_btn:
     images = []
+    
     if image_source == "Upload your own images":
         if not uploaded_images:
             st.error("Please upload at least one image.")
         else:
             images = [img.copy() for img in uploaded_images]
-    else:
+    elif image_source == "Placeholder images (no API required)":
         if not prompts:
             st.error("Please enter at least one prompt.")
         else:
-            # Generation via HF or Replicate
-            with st.spinner("Generating images..."):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+            with st.spinner("Generating placeholder images..."):
                 for i, prompt in enumerate(prompts):
-                    status_text.text(f"Generating image {i+1}/{len(prompts)}: {prompt[:30]}...")
-                    img_data = None
-                    if image_source == "Generate with Hugging Face":
-                        if not hf_token:
-                            st.error("Hugging Face token is required.")
-                            break
-                        img_bytes = generate_image_hf(prompt, hf_token, hf_model)
-                        if img_bytes:
-                            img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-                            img_data = img
-                    else:  # Replicate
-                        if not replicate_key:
-                            st.error("Replicate token is required.")
-                            break
-                        img_url = generate_image_replicate(prompt, replicate_key, replicate_model)
-                        if img_url:
-                            try:
-                                resp = requests.get(img_url, timeout=30)
-                                if resp.status_code == 200:
-                                    img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+                    img = generate_placeholder(prompt, size=video_size)
+                    text_overlay = product_name if i == 0 and product_name else None
+                    slide_img = create_slide_image(img, text=text_overlay,
+                                                   text_color=title_color,
+                                                   font_size=title_font_size,
+                                                   size=video_size)
+                    images.append(slide_img)
+    else:
+        # HF or Replicate generation
+        if not prompts:
+            st.error("Please enter at least one prompt.")
+        else:
+            # Check if API key is provided
+            if image_source == "Generate with Hugging Face" and not hf_token:
+                st.error("Hugging Face token is required.")
+            elif image_source == "Generate with Replicate" and not replicate_key:
+                st.error("Replicate token is required.")
+            else:
+                with st.spinner("Generating images... (this may take a while)"):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    for i, prompt in enumerate(prompts):
+                        status_text.text(f"Generating image {i+1}/{len(prompts)}: {prompt[:30]}...")
+                        img_data = None
+                        if image_source == "Generate with Hugging Face":
+                            img_bytes = generate_image_hf(prompt, hf_token, hf_model)
+                            if img_bytes:
+                                try:
+                                    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
                                     img_data = img
-                                else:
-                                    st.error(f"Download failed: {resp.status_code}")
-                            except Exception as e:
-                                st.error(f"Download error: {e}")
-                    if img_data:
+                                except:
+                                    pass
+                        else:  # Replicate
+                            img_url = generate_image_replicate(prompt, replicate_key, replicate_model)
+                            if img_url:
+                                try:
+                                    resp = requests.get(img_url, timeout=30)
+                                    if resp.status_code == 200:
+                                        img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+                                        img_data = img
+                                except:
+                                    pass
+                        # If generation failed, fallback to placeholder
+                        if img_data is None:
+                            st.warning(f"Using placeholder for prompt {i+1} due to API failure.")
+                            img_data = generate_placeholder(prompt, size=video_size)
                         # Add title overlay on first slide
                         text_overlay = product_name if i == 0 and product_name else None
                         slide_img = create_slide_image(img_data, text=text_overlay,
@@ -302,10 +379,10 @@ if generate_btn:
                                                        font_size=title_font_size,
                                                        size=video_size)
                         images.append(slide_img)
-                    progress_bar.progress((i+1)/len(prompts))
-                status_text.empty()
-                progress_bar.empty()
-
+                        progress_bar.progress((i+1)/len(prompts))
+                    status_text.empty()
+                    progress_bar.empty()
+    
     if images:
         # Build video
         with st.spinner("Composing video..."):
