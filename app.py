@@ -6,7 +6,6 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import moviepy.editor as mp
-from moviepy.editor import ImageSequenceClip, AudioFileClip, CompositeVideoClip, TextClip, concatenate_videoclips, ColorClip
 import base64
 import uuid
 import io
@@ -73,7 +72,7 @@ with st.sidebar:
                              "Generate with Replicate", 
                              "Upload your own images",
                              "Placeholder images (no API required)"],
-                            help="Placeholder images work without any API key.")
+                            help="Placeholder images work without any API key and show your prompts clearly.")
     
     if image_source == "Generate with Hugging Face":
         hf_token = st.text_input("Hugging Face API Token", type="password", 
@@ -88,7 +87,7 @@ with st.sidebar:
     elif image_source == "Upload your own images":
         st.info("You will upload images in the main area.")
     else:
-        st.info("Placeholder images will be generated with professional gradients and your prompt text.")
+        st.info("Placeholder images will be generated with your prompt text on a dark gradient background.")
     
     st.markdown("---")
     st.subheader("Video Settings")
@@ -120,7 +119,7 @@ with st.sidebar:
 st.subheader("📝 Prompts for Images")
 st.caption("Enter one prompt per line. Each prompt will generate a slide.")
 prompts_text = st.text_area("Prompts", height=200, 
-                            placeholder="e.g.\nA modern money transfer app on a smartphone\nA family receiving money in Haiti\nA fast digital payment interface\nA happy customer using mobile money")
+                            placeholder="e.g.\nA modern money transfer app on a smartphone in Haiti\nA Haitian family receiving money via mobile payment\nA fast digital payment interface with MonCash logo\nA happy customer using mobile money in Port-au-Prince\nA world map connecting Miami, New York, and Haiti with golden lines\nA golden shield representing secure transactions\nA person sending money at night with a glowing phone screen\nA group of happy Haitians celebrating with smartphones")
 prompts = [p.strip() for p in prompts_text.split('\n') if p.strip()]
 
 uploaded_images = []
@@ -141,56 +140,49 @@ with col2:
 
 video_placeholder = st.empty()
 
-# ---- Enhanced placeholder generation ----
+# ---- Strong placeholder generation with prominent text ----
 def generate_placeholder(prompt, size=(1920,1080)):
-    """Generate a professional-looking gradient image with geometric elements and text."""
+    """
+    Create a dark gradient background with the prompt displayed in large,
+    bold white text with a black outline, ensuring maximum readability.
+    """
     img = Image.new('RGB', size)
     draw = ImageDraw.Draw(img)
     
-    # Random color palettes
-    palettes = [
-        ((20,40,80), (80,20,120)),
-        ((10,60,40), (100,40,20)),
-        ((60,20,80), (20,60,100)),
-        ((40,20,60), (120,80,20)),
-        ((20,60,80), (80,20,40)),
-    ]
-    color1, color2 = random.choice(palettes)
-    
-    # Smooth vertical gradient
+    # Dark gradient (dark blue to dark purple/black)
     for y in range(size[1]):
         ratio = y / size[1]
-        r = int(color1[0] * (1 - ratio) + color2[0] * ratio)
-        g = int(color1[1] * (1 - ratio) + color2[1] * ratio)
-        b = int(color1[2] * (1 - ratio) + color2[2] * ratio)
+        r = int(10 + 20 * ratio)
+        g = int(20 + 10 * ratio)
+        b = int(40 + 60 * ratio)
         draw.line([(0, y), (size[0], y)], fill=(r, g, b))
     
-    # Draw semi-transparent circles
-    circle_centers = [
-        (size[0]//2, size[1]//2),
-        (size[0]//4, size[1]//4),
-        (3*size[0]//4, 3*size[1]//4)
-    ]
-    radii = [size[0]//3, size[0]//6, size[0]//5]
-    for center, radius in zip(circle_centers, radii):
+    # Add a subtle glowing circle in the center
+    glow_center = (size[0]//2, size[1]//2)
+    glow_radius = size[0]//4
+    for i in range(10, 0, -1):
+        alpha = int(10 - i * 1)
+        radius = glow_radius * i // 10
         overlay = Image.new('RGBA', size, (0,0,0,0))
         overlay_draw = ImageDraw.Draw(overlay)
         overlay_draw.ellipse(
-            (center[0]-radius, center[1]-radius, center[0]+radius, center[1]+radius),
-            fill=(255,255,255,20)
+            (glow_center[0]-radius, glow_center[1]-radius, 
+             glow_center[0]+radius, glow_center[1]+radius),
+            fill=(255,255,255,alpha)
         )
         img = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
     
-    # Draw a thin border rectangle
-    rect = (size[0]//10, size[1]//10, size[0]-size[0]//10, size[1]-size[1]//10)
-    draw.rectangle(rect, outline=(255,255,255,30), width=3)
-    
-    # Large, bold text
+    # Load a large font
     try:
-        font = ImageFont.truetype("Arial", 100)
+        font = ImageFont.truetype("Arial", 120)
     except:
-        font = ImageFont.load_default()
-    max_width = size[0] - 150
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 120)
+        except:
+            font = ImageFont.load_default()
+    
+    # Wrap text to fit within 1600px width
+    max_width = size[0] - 200
     lines = []
     words = prompt.split()
     if words:
@@ -207,25 +199,31 @@ def generate_placeholder(prompt, size=(1920,1080)):
                 line = word + " "
         if line:
             lines.append(line.strip())
+    
+    # Calculate total height
     total_height = 0
     for line in lines:
         bbox = draw.textbbox((0,0), line, font=font)
         total_height += bbox[3] - bbox[1]
-    total_height += (len(lines) - 1) * 20
+    total_height += (len(lines) - 1) * 30
+    
     y_text = (size[1] - total_height) // 2
     for line in lines:
         bbox = draw.textbbox((0,0), line, font=font)
         w = bbox[2] - bbox[0]
         x_text = (size[0] - w) // 2
-        # Black stroke
-        for dx in (-3,0,3):
-            for dy in (-3,0,3):
-                draw.text((x_text+dx, y_text+dy), line, font=font, fill='black')
+        # Draw thick black outline
+        for dx in range(-4, 5, 2):
+            for dy in range(-4, 5, 2):
+                if dx != 0 or dy != 0:
+                    draw.text((x_text+dx, y_text+dy), line, font=font, fill='black')
         draw.text((x_text, y_text), line, font=font, fill='white')
-        y_text += bbox[3] + 20
+        y_text += bbox[3] + 30
+    
     return img
 
 def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=(1920,1080)):
+    """Resize image and optionally add a title overlay (for product name)."""
     if img.size != size:
         img.thumbnail(size, Image.Resampling.LANCZOS)
         new_img = Image.new('RGB', size, (0,0,0))
@@ -294,6 +292,7 @@ def create_video(image_list, durations, output_path, music_path=None, transition
                           temp_audiofile='temp_audio.m4a', remove_temp=True, verbose=False, logger=None)
     return output_path
 
+# ---- API generation functions (unchanged) ----
 def generate_image_hf(prompt, token, model):
     if not token:
         return None
@@ -342,7 +341,7 @@ def generate_image_replicate(prompt, token, model):
         st.warning(f"Replicate error: {e}")
         return None
 
-# Generate logic
+# ---- Generate logic ----
 if generate_btn:
     images = []
     
@@ -387,7 +386,7 @@ if generate_btn:
                                 try:
                                     img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
                                     img_data = img
-                                except Exception as e:
+                                except:
                                     pass
                         else:
                             img_url = generate_image_replicate(prompt, replicate_key, replicate_model)
@@ -397,7 +396,7 @@ if generate_btn:
                                     if resp.status_code == 200:
                                         img = Image.open(io.BytesIO(resp.content)).convert('RGB')
                                         img_data = img
-                                except Exception as e:
+                                except:
                                     pass
                         if img_data is None:
                             st.warning(f"Using placeholder for prompt {i+1} due to API failure.")
