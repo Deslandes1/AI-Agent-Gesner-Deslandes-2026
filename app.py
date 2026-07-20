@@ -12,6 +12,8 @@ import base64
 import uuid
 import io
 import json
+import random
+import colorsys
 
 # Page config
 st.set_page_config(
@@ -69,7 +71,6 @@ st.markdown('<div class="subtitle">Create a video from prompts or your own image
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    # Image source selection
     image_source = st.radio("Image Source", 
                             ["Generate with Hugging Face", 
                              "Generate with Replicate", 
@@ -90,7 +91,7 @@ with st.sidebar:
     elif image_source == "Upload your own images":
         st.info("You will upload images in the main area.")
     else:
-        st.info("Placeholder images will be generated with gradient backgrounds and your prompt text.")
+        st.info("Placeholder images will be generated with professional gradients and your prompt text.")
     
     st.markdown("---")
     st.subheader("Video Settings")
@@ -125,7 +126,6 @@ prompts_text = st.text_area("Prompts", height=200,
                             placeholder="e.g.\nA modern money transfer app on a smartphone\nA family receiving money in Haiti\nA fast digital payment interface\nA happy customer using mobile money")
 prompts = [p.strip() for p in prompts_text.split('\n') if p.strip()]
 
-# If user uploads own images
 uploaded_images = []
 if image_source == "Upload your own images":
     uploaded_files = st.file_uploader("Upload images (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
@@ -144,24 +144,50 @@ with col2:
 
 video_placeholder = st.empty()
 
-# Helper functions
+# ---- Enhanced placeholder generation ----
 def generate_placeholder(prompt, size=(1920,1080)):
-    """Generate a gradient placeholder image with prompt text."""
     img = Image.new('RGB', size)
     draw = ImageDraw.Draw(img)
-    # Gradient from dark blue to purple
+    
+    palettes = [
+        ((20,40,80), (80,20,120)),
+        ((10,60,40), (100,40,20)),
+        ((60,20,80), (20,60,100)),
+        ((40,20,60), (120,80,20)),
+        ((20,60,80), (80,20,40)),
+    ]
+    color1, color2 = random.choice(palettes)
+    
     for y in range(size[1]):
         ratio = y / size[1]
-        r = int(20 + 50 * ratio)
-        g = int(40 + 30 * ratio)
-        b = int(80 + 100 * ratio)
+        r = int(color1[0] * (1 - ratio) + color2[0] * ratio)
+        g = int(color1[1] * (1 - ratio) + color2[1] * ratio)
+        b = int(color1[2] * (1 - ratio) + color2[2] * ratio)
         draw.line([(0, y), (size[0], y)], fill=(r, g, b))
-    # Draw prompt text
+    
+    # Geometric shapes
+    shapes = [
+        ('circle', (size[0]//2, size[1]//2), size[0]//3),
+        ('circle', (size[0]//4, size[1]//4), size[0]//6),
+        ('circle', (3*size[0]//4, 3*size[1]//4), size[0]//5),
+        ('rectangle', (size[0]//10, size[1]//10, size[0]-size[0]//10, size[1]-size[1]//10)),
+    ]
+    for shape in shapes:
+        if shape[0] == 'circle':
+            x, y, r = shape[1], shape[2], shape[3]
+            overlay = Image.new('RGBA', size, (0,0,0,0))
+            overlay_draw = ImageDraw.Draw(overlay)
+            overlay_draw.ellipse((x-r, y-r, x+r, y+r), fill=(255,255,255,20))
+            img = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
+        elif shape[0] == 'rectangle':
+            draw.rectangle(shape[1], outline=(255,255,255,30), width=3)
+    
+    # Large text
     try:
-        font = ImageFont.truetype("Arial", 60)
+        font = ImageFont.truetype("Arial", 100)
     except:
         font = ImageFont.load_default()
-    max_width = size[0] - 100
+    max_width = size[0] - 150
     lines = []
     words = prompt.split()
     if words:
@@ -182,64 +208,20 @@ def generate_placeholder(prompt, size=(1920,1080)):
     for line in lines:
         bbox = draw.textbbox((0,0), line, font=font)
         total_height += bbox[3] - bbox[1]
-    total_height += (len(lines) - 1) * 10
+    total_height += (len(lines) - 1) * 20
     y_text = (size[1] - total_height) // 2
     for line in lines:
         bbox = draw.textbbox((0,0), line, font=font)
         w = bbox[2] - bbox[0]
         x_text = (size[0] - w) // 2
+        for dx in (-3,0,3):
+            for dy in (-3,0,3):
+                draw.text((x_text+dx, y_text+dy), line, font=font, fill='black')
         draw.text((x_text, y_text), line, font=font, fill='white')
-        y_text += bbox[3] + 10
+        y_text += bbox[3] + 20
     return img
 
-def generate_image_hf(prompt, token, model):
-    """Generate an image using Hugging Face inference API with retry."""
-    if not token:
-        return None
-    API_URL = f"https://api-inference.huggingface.co/models/{model}"
-    headers = {"Authorization": f"Bearer {token}"}
-    payload = {"inputs": prompt}
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-            if response.status_code == 200:
-                return response.content
-            elif response.status_code == 503:
-                time.sleep(5)
-                continue
-            else:
-                st.warning(f"HF attempt {attempt+1} failed: {response.status_code}")
-                time.sleep(2)
-        except Exception as e:
-            st.warning(f"HF attempt {attempt+1} error: {e}")
-            time.sleep(2)
-    return None
-
-def generate_image_replicate(prompt, token, model):
-    """Generate an image using Replicate."""
-    if not token:
-        return None
-    import replicate
-    os.environ["REPLICATE_API_TOKEN"] = token
-    try:
-        if "stable-diffusion" in model or "FLUX" in model:
-            input = {"prompt": prompt, "aspect_ratio": "16:9", "output_format": "png"}
-        else:
-            input = {"prompt": prompt, "num_inference_steps": 30, "guidance_scale": 7.5}
-        output = replicate.run(model, input=input)
-        if isinstance(output, list):
-            return output[0]
-        elif isinstance(output, str):
-            return output
-        else:
-            return None
-    except Exception as e:
-        st.warning(f"Replicate error: {e}")
-        return None
-
 def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=(1920,1080)):
-    """Resize image and optionally add text overlay."""
     if img.size != size:
         img.thumbnail(size, Image.Resampling.LANCZOS)
         new_img = Image.new('RGB', size, (0,0,0))
@@ -288,7 +270,6 @@ def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=
     return img
 
 def create_video(image_list, durations, output_path, music_path=None, transition_duration=1):
-    """Create a video from a list of images with crossfade transitions."""
     clips = []
     for idx, img in enumerate(image_list):
         img_np = np.array(img)
@@ -309,6 +290,50 @@ def create_video(image_list, durations, output_path, music_path=None, transition
                           temp_audiofile='temp_audio.m4a', remove_temp=True, verbose=False, logger=None)
     return output_path
 
+def generate_image_hf(prompt, token, model):
+    if not token:
+        return None
+    API_URL = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"inputs": prompt}
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                return response.content
+            elif response.status_code == 503:
+                time.sleep(5)
+                continue
+            else:
+                st.warning(f"HF attempt {attempt+1} failed: {response.status_code}")
+                time.sleep(2)
+        except Exception as e:
+            st.warning(f"HF attempt {attempt+1} error: {e}")
+            time.sleep(2)
+    return None
+
+def generate_image_replicate(prompt, token, model):
+    if not token:
+        return None
+    import replicate
+    os.environ["REPLICATE_API_TOKEN"] = token
+    try:
+        if "stable-diffusion" in model or "FLUX" in model:
+            input = {"prompt": prompt, "aspect_ratio": "16:9", "output_format": "png"}
+        else:
+            input = {"prompt": prompt, "num_inference_steps": 30, "guidance_scale": 7.5}
+        output = replicate.run(model, input=input)
+        if isinstance(output, list):
+            return output[0]
+        elif isinstance(output, str):
+            return output
+        else:
+            return None
+    except Exception as e:
+        st.warning(f"Replicate error: {e}")
+        return None
+
 # Generate logic
 if generate_btn:
     images = []
@@ -317,7 +342,6 @@ if generate_btn:
         if not uploaded_images:
             st.error("Please upload at least one image.")
         else:
-            # Resize all uploaded images to target size
             for img in uploaded_images:
                 resized = create_slide_image(img, size=video_size)
                 images.append(resized)
@@ -335,11 +359,9 @@ if generate_btn:
                                                    size=video_size)
                     images.append(slide_img)
     else:
-        # HF or Replicate generation
         if not prompts:
             st.error("Please enter at least one prompt.")
         else:
-            # Check if API key is provided
             if image_source == "Generate with Hugging Face" and not hf_token:
                 st.error("Hugging Face token is required.")
             elif image_source == "Generate with Replicate" and not replicate_key:
@@ -359,7 +381,7 @@ if generate_btn:
                                     img_data = img
                                 except:
                                     pass
-                        else:  # Replicate
+                        else:
                             img_url = generate_image_replicate(prompt, replicate_key, replicate_model)
                             if img_url:
                                 try:
@@ -369,11 +391,9 @@ if generate_btn:
                                         img_data = img
                                 except:
                                     pass
-                        # If generation failed, fallback to placeholder
                         if img_data is None:
                             st.warning(f"Using placeholder for prompt {i+1} due to API failure.")
                             img_data = generate_placeholder(prompt, size=video_size)
-                        # Add title overlay on first slide
                         text_overlay = product_name if i == 0 and product_name else None
                         slide_img = create_slide_image(img_data, text=text_overlay,
                                                        text_color=title_color,
@@ -385,7 +405,6 @@ if generate_btn:
                     progress_bar.empty()
     
     if images:
-        # Build video
         with st.spinner("Composing video..."):
             durations = [duration_per_image] * len(images)
             temp_dir = tempfile.mkdtemp()
@@ -397,7 +416,6 @@ if generate_btn:
                     music_path = tmp.name
             create_video(images, durations, video_path, music_path, transition_duration)
             
-            # Display & download
             with open(video_path, "rb") as f:
                 video_bytes = f.read()
             b64 = base64.b64encode(video_bytes).decode()
@@ -414,7 +432,6 @@ if generate_btn:
                 mime="video/mp4",
                 use_container_width=True
             )
-            # Cleanup
             for f in os.listdir(temp_dir):
                 try:
                     os.remove(os.path.join(temp_dir, f))
