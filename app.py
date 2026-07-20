@@ -10,6 +10,7 @@ import shutil
 import math
 from PIL import Image, ImageDraw, ImageFont
 import moviepy.editor as mp
+from pydub import AudioSegment
 
 # Page config
 st.set_page_config(page_title="AI Talking Head", page_icon="🎭", layout="wide")
@@ -74,34 +75,26 @@ with col2:
 video_placeholder = st.empty()
 
 # ------------------------------------------------------------------
-# Core functions (no cv2, no mediapipe)
+# Core functions
 # ------------------------------------------------------------------
 
 def draw_mouth(draw, center_x, center_y, width, height, open_ratio=0.0, color=(200, 150, 130)):
-    """
-    Draw a semi‑realistic mouth at the given position.
-    open_ratio: 0 = closed (thin line), 1 = fully open (ellipse)
-    """
+    """Draw a semi‑realistic mouth."""
     if open_ratio < 0.05:
-        # Closed mouth: a horizontal line with a slight curve
         draw.line((center_x - width//2, center_y, center_x + width//2, center_y), fill=color, width=4)
         draw.line((center_x - width//2, center_y+2, center_x + width//2, center_y+2), fill=(100,70,60), width=2)
         return
-    # Open mouth: an ellipse that becomes more oval as it opens
     current_height = int(height * (0.2 + 0.8 * open_ratio))
-    # Dark inner background
     draw.ellipse(
         (center_x - width//2, center_y - current_height//2,
          center_x + width//2, center_y + current_height//2),
         fill=(50, 30, 20, 200)
     )
-    # Lips (outer ellipse)
     draw.ellipse(
         (center_x - width//2 - 2, center_y - current_height//2 - 2,
          center_x + width//2 + 2, center_y + current_height//2 + 2),
         outline=(color[0], color[1], color[2], 255), width=3
     )
-    # Inner bright area (tongue hint)
     if current_height > 10:
         draw.ellipse(
             (center_x - width//3, center_y - current_height//4,
@@ -121,47 +114,41 @@ def generate_video(image_path, script, voice, output_path, offset_x=0, offset_y=
     img = Image.open(image_path).convert('RGBA')
     w, h = img.size
 
-    # Estimate face center (assuming portrait: face is roughly in the upper half)
     face_center_x = w // 2
-    face_center_y = int(h * 0.35)  # eyes at ~1/3 from top
-
-    # Mouth position (below face center)
+    face_center_y = int(h * 0.35)
     mouth_x = face_center_x + offset_x
     mouth_y = face_center_y + int(h * 0.2) + offset_y
-
-    # Mouth dimensions (scaled)
     base_width = int(w * 0.15 * mouth_scale)
     base_height = int(w * 0.06 * mouth_scale)
 
-    # 3. Get audio amplitude
-    audio_clip = mp.AudioFileClip(audio_path)
-    duration = audio_clip.duration
-    num_frames = max(1, int(duration * 24))  # 24 fps
-
-    # Extract audio as mono array (average channels)
-    audio_array = audio_clip.to_soundarray(fps=22050).mean(axis=1)
-    if len(audio_array) == 0:
-        # Fallback: use a simple sine wave for demonstration
-        audio_array = np.sin(2 * np.pi * 5 * np.arange(num_frames * 24) / 24) * 0.5 + 0.5
-    else:
-        # Resample to match num_frames
-        # We'll take segments to get amplitude per frame
-        segment_len = max(1, len(audio_array) // num_frames)
-        amplitudes = []
-        for i in range(num_frames):
-            start = i * segment_len
-            end = min(start + segment_len, len(audio_array))
-            seg = audio_array[start:end]
-            rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
-            amplitudes.append(rms)
-        max_amp = max(amplitudes) if amplitudes else 1
-        amplitudes = [a / max_amp for a in amplitudes]
+    # 3. Extract audio amplitude using pydub (reliable)
+    audio_seg = AudioSegment.from_mp3(audio_path)
+    # Convert to mono
+    audio_seg = audio_seg.set_channels(1)
+    # Get raw data as numpy array
+    samples = np.array(audio_seg.get_array_of_samples())
+    # Normalize to -1..1
+    samples = samples / (2.0 ** (8 * audio_seg.sample_width - 1))
+    # Resample to target frame rate (24 fps)
+    target_fps = 24
+    duration = len(samples) / audio_seg.frame_rate
+    num_frames = max(1, int(duration * target_fps))
+    segment_len = max(1, len(samples) // num_frames)
+    amplitudes = []
+    for i in range(num_frames):
+        start = i * segment_len
+        end = min(start + segment_len, len(samples))
+        seg = samples[start:end]
+        rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
+        amplitudes.append(rms)
+    max_amp = max(amplitudes) if amplitudes else 1
+    amplitudes = [a / max_amp for a in amplitudes]
 
     # 4. Generate frames
     frames = []
-    lip_color = (200, 150, 130)  # default
+    lip_color = (200, 150, 130)
     for amp in amplitudes:
-        open_ratio = min(1.0, amp * 1.5)  # amplify a bit for more movement
+        open_ratio = min(1.0, amp * 1.5)
         frame = img.copy()
         draw = ImageDraw.Draw(frame, 'RGBA')
         draw_mouth(draw, mouth_x, mouth_y, base_width, base_height, open_ratio, lip_color)
@@ -174,6 +161,7 @@ def generate_video(image_path, script, voice, output_path, offset_x=0, offset_y=
     video = video.set_audio(audio)
     video.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac',
                           verbose=False, logger=None)
+    # Cleanup
     os.remove(audio_path)
     return output_path
 
@@ -189,11 +177,9 @@ if generate_btn:
         with st.spinner("🎬 Generating video... (this may take a minute)"):
             try:
                 temp_dir = tempfile.mkdtemp()
-                # Save uploaded image
                 image_path = os.path.join(temp_dir, "input.jpg")
                 img = Image.open(uploaded_image).convert('RGB')
                 img.save(image_path)
-                # Generate video
                 output_path = os.path.join(temp_dir, "output.mp4")
                 generate_video(
                     image_path,
@@ -204,7 +190,6 @@ if generate_btn:
                     offset_y,
                     mouth_scale
                 )
-                # Display and download
                 with open(output_path, "rb") as f:
                     video_bytes = f.read()
                 b64 = base64.b64encode(video_bytes).decode()
@@ -217,7 +202,6 @@ if generate_btn:
                 st.download_button("⬇️ Download Video (MP4)", video_bytes,
                                    file_name="talking_head.mp4", mime="video/mp4",
                                    use_container_width=True)
-                # Cleanup
                 shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception as e:
                 st.error(f"An error occurred: {e}")
