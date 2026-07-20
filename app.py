@@ -109,54 +109,71 @@ video_placeholder = st.empty()
 def get_audio_amplitude(audio_path, num_frames=100):
     """Extract amplitude envelope from audio to drive mouth movement."""
     try:
-        wf = wave.open(audio_path, 'rb')
-        n_channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        n_frames = wf.getnframes()
-        framerate = wf.getframerate()
-        duration = n_frames / float(framerate)
-        wf.close()
-        
-        # We'll read the audio with moviepy to get raw data
         audio_clip = mp.AudioFileClip(audio_path)
-        # Resample to get amplitude at each frame (we'll average)
-        # We'll get the audio array (mono)
+        framerate = audio_clip.fps if audio_clip.fps else 22050
         audio_array = audio_clip.to_soundarray(n_channels=1, fps=framerate)
         audio_array = audio_array.flatten()
         
-        # Divide into segments
         segment_len = len(audio_array) // num_frames
+        if segment_len == 0:
+            segment_len = 1
         amplitudes = []
         for i in range(num_frames):
             start = i * segment_len
-            end = start + segment_len
+            end = min(start + segment_len, len(audio_array))
             seg = audio_array[start:end]
-            rms = np.sqrt(np.mean(seg**2))
+            rms = np.sqrt(np.mean(seg**2)) if len(seg) > 0 else 0
             amplitudes.append(rms)
         
-        # Normalize to 0-1
         max_amp = max(amplitudes) if max(amplitudes) > 0 else 1
         amplitudes = [a / max_amp for a in amplitudes]
-        return amplitudes, duration
+        return amplitudes, audio_clip.duration
     except Exception as e:
         st.warning(f"Audio analysis failed: {e}. Using fallback.")
         return [0.5] * num_frames, 5.0
 
 def detect_face_region(image_path):
-    """Detect face and mouth region using OpenCV Haar cascade."""
+    """
+    Detect face using Haar cascade if available; fallback to heuristic.
+    Returns (mouth_x, mouth_y, mouth_w, mouth_h) or (center region) on fallback.
+    """
     img = cv2.imread(image_path)
+    if img is None:
+        return None, None, None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+    h, w = gray.shape
+    
+    # Try to load cascade
+    cascade = None
+    try:
+        # Try built-in path
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        cascade = cv2.CascadeClassifier(cascade_path)
+    except AttributeError:
+        # Fallback: try to load from local file if present (we'll not rely on it)
+        pass
+    
+    faces = []
+    if cascade is not None and not cascade.empty():
+        faces = cascade.detectMultiScale(gray, 1.1, 4)
+    
     if len(faces) == 0:
-        return None, None, None  # no face
-    (x, y, w, h) = faces[0]
-    # Mouth region is roughly lower third of face, centered
-    mouth_x = x + int(w * 0.2)
-    mouth_y = y + int(h * 0.6)
-    mouth_w = int(w * 0.6)
-    mouth_h = int(h * 0.2)
-    return (mouth_x, mouth_y, mouth_w, mouth_h), (x, y, w, h), gray
+        # No face detected: assume face is in the upper-center area
+        st.warning("No face detected. Using center of image for mouth.")
+        # Assume mouth is at roughly 60% of height, 20-80% of width
+        mouth_x = int(w * 0.25)
+        mouth_y = int(h * 0.55)
+        mouth_w = int(w * 0.5)
+        mouth_h = int(h * 0.15)
+        return (mouth_x, mouth_y, mouth_w, mouth_h), None, gray
+    
+    (x, y, w_face, h_face) = faces[0]
+    # Mouth region: lower third of face, centered
+    mouth_x = x + int(w_face * 0.2)
+    mouth_y = y + int(h_face * 0.6)
+    mouth_w = int(w_face * 0.6)
+    mouth_h = int(h_face * 0.2)
+    return (mouth_x, mouth_y, mouth_w, mouth_h), (x, y, w_face, h_face), gray
 
 def create_mouth_images(mouth_width, mouth_height, open_ratio=0.8):
     """Generate two mouth images: closed (thin line) and open (ellipse)."""
@@ -198,7 +215,7 @@ def generate_talking_video(image_path, script, voice, output_path, music_path=No
     
     mouth_region, face_rect, gray = detect_face_region(temp_img_path)
     if mouth_region is None:
-        st.warning("No face detected. Using center of image for mouth.")
+        st.warning("Could not detect face. Using center of image for mouth.")
         h, w = img_np.shape[:2]
         mouth_x = w//2 - 100
         mouth_y = h//2 + 50
@@ -209,10 +226,8 @@ def generate_talking_video(image_path, script, voice, output_path, music_path=No
     
     # 3. Get audio amplitude
     amplitudes, audio_duration = get_audio_amplitude(audio_path, num_frames=100)
-    # Determine number of frames (we'll create 1 frame per amplitude segment)
     frame_count = len(amplitudes)
-    frame_duration = audio_duration / frame_count
-    # Also create a smoother sequence by interpolating?
+    frame_duration = audio_duration / frame_count if frame_count > 0 else 0.1
     
     # 4. Prepare mouth images
     closed_mouth, open_mouth = create_mouth_images(mouth_w, mouth_h)
@@ -220,24 +235,18 @@ def generate_talking_video(image_path, script, voice, output_path, music_path=No
     # 5. Generate frames with mouth sync
     frames = []
     for i, amp in enumerate(amplitudes):
-        # Determine mouth state: if amp > threshold, open, else closed
         threshold = 0.3 * mouth_amp
-        if amp > threshold:
-            mouth_img = open_mouth
-        else:
-            mouth_img = closed_mouth
+        mouth_img = open_mouth if amp > threshold else closed_mouth
         
-        # Create a copy of the base image
         frame = img.copy().convert('RGBA')
-        # Paste mouth at the detected region
         frame.paste(mouth_img, (mouth_x, mouth_y), mouth_img)
         
-        # Apply head sway (rotation) - subtle
+        # Head sway
         if head_sway > 0:
-            angle = head_sway * math.sin(i / frame_count * 2 * math.pi * 2)  # two cycles
+            angle = head_sway * math.sin(i / frame_count * 2 * math.pi * 2)
             frame = frame.rotate(angle, center=(frame.width//2, frame.height//2), resample=Image.BICUBIC, fillcolor=(0,0,0,0))
         
-        # Apply zoom (Ken Burns effect) - slow zoom in/out
+        # Zoom effect
         if zoom_speed > 0:
             zoom_factor = 1 + 0.02 * math.sin(i / frame_count * 2 * math.pi) * zoom_speed
             new_size = (int(frame.width * zoom_factor), int(frame.height * zoom_factor))
@@ -252,8 +261,7 @@ def generate_talking_video(image_path, script, voice, output_path, music_path=No
         frames.append(np.array(frame))
     
     # 6. Create video clip from frames
-    video_clip = mp.ImageSequenceClip(frames, fps=1/frame_duration)
-    # Set audio
+    video_clip = mp.ImageSequenceClip(frames, fps=1/frame_duration) if frame_duration > 0 else mp.ImageSequenceClip(frames, fps=24)
     audio_clip = mp.AudioFileClip(audio_path)
     video_clip = video_clip.set_audio(audio_clip)
     
