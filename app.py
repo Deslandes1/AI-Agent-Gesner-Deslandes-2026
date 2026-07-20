@@ -147,7 +147,6 @@ video_placeholder = st.empty()
 # Helper functions
 def generate_placeholder(prompt, size=(1920,1080)):
     """Generate a gradient placeholder image with prompt text."""
-    # Create a colorful gradient
     img = Image.new('RGB', size)
     draw = ImageDraw.Draw(img)
     # Gradient from dark blue to purple
@@ -162,7 +161,6 @@ def generate_placeholder(prompt, size=(1920,1080)):
         font = ImageFont.truetype("Arial", 60)
     except:
         font = ImageFont.load_default()
-    # Wrap text
     max_width = size[0] - 100
     lines = []
     words = prompt.split()
@@ -208,7 +206,6 @@ def generate_image_hf(prompt, token, model):
             if response.status_code == 200:
                 return response.content
             elif response.status_code == 503:
-                # Model loading, wait and retry
                 time.sleep(5)
                 continue
             else:
@@ -290,11 +287,12 @@ def create_slide_image(img, text=None, text_color="#FFFFFF", font_size=80, size=
             y_text += bbox[3] + 10
     return img
 
-def create_video(image_list, durations, output_path, music_path=None, transition_duration=1, size=(1920,1080)):
+def create_video(image_list, durations, output_path, music_path=None, transition_duration=1):
+    """Create a video from a list of images with crossfade transitions."""
     clips = []
     for idx, img in enumerate(image_list):
         img_np = np.array(img)
-        clip = mp.ImageClip(img_np).set_duration(durations[idx]).resize(size)
+        clip = mp.ImageClip(img_np).set_duration(durations[idx])
         if idx > 0 and transition_duration > 0:
             clip = clip.crossfadein(transition_duration)
         clips.append(clip)
@@ -319,7 +317,10 @@ if generate_btn:
         if not uploaded_images:
             st.error("Please upload at least one image.")
         else:
-            images = [img.copy() for img in uploaded_images]
+            # Resize all uploaded images to target size
+            for img in uploaded_images:
+                resized = create_slide_image(img, size=video_size)
+                images.append(resized)
     elif image_source == "Placeholder images (no API required)":
         if not prompts:
             st.error("Please enter at least one prompt.")
@@ -394,7 +395,7 @@ if generate_btn:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
                     tmp.write(music_file.read())
                     music_path = tmp.name
-            create_video(images, durations, video_path, music_path, transition_duration, video_size)
+            create_video(images, durations, video_path, music_path, transition_duration)
             
             # Display & download
             with open(video_path, "rb") as f:
